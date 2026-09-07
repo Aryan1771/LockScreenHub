@@ -1,6 +1,7 @@
 using Microsoft.UI.Xaml;
 using Microsoft.Windows.AppNotifications;
 using System;
+using System.Diagnostics;
 
 namespace LockScreenHub;
 
@@ -21,8 +22,10 @@ public partial class App : Application
             manager.NotificationInvoked += OnNotificationInvoked;
             manager.Register();
         }
-        catch
+        catch (Exception ex)
         {
+            // CWE-778: Log notification registration errors for security auditing
+            Debug.WriteLine($"App notification registration failed: {ex.GetType().Name} - {ex.Message}");
             // Notification registration is optional for the UI to start.
         }
 

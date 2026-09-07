@@ -1,5 +1,6 @@
 using Microsoft.Win32;
 using System;
+using System.Diagnostics;
 
 namespace LockScreenHub.Services;
 
@@ -25,8 +26,10 @@ public static class WindowsPolicyService
             key.SetValue("SubscribedContent-353694Enabled", 0, RegistryValueKind.DWord);
             return true;
         }
-        catch
+        catch (Exception ex)
         {
+            // CWE-778: Log registry access errors for security auditing
+            Debug.WriteLine($"WindowsPolicyService registry access failed: {ex.GetType().Name} - {ex.Message}");
             return false;
         }
     }

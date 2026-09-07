@@ -1,15 +1,18 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using Windows.UI.Notifications;
 using Windows.UI.Notifications.Management;
 using LockScreenHub.Models;
+using System.Diagnostics;
 
 namespace LockScreenHub.Services;
 
 public sealed class NotificationListenerService : IAsyncDisposable
 {
     private readonly UserNotificationListener _listener;
-    private bool _started;
+    private volatile bool _started; // Thread-safe field access for CWE-820
+    private readonly object _lockObject = new();
 
     public event EventHandler<UnifiedNotification>? NotificationReceived;
 
@@ -25,14 +28,21 @@ public sealed class NotificationListenerService : IAsyncDisposable
         if (status != UserNotificationListenerAccessStatus.Allowed)
             return false;
 
-        _listener.NotificationChanged += OnNotificationChanged;
-        _started = true;
+        lock (_lockObject) // CWE-567, CWE-662: Synchronized access
+        {
+            _listener.NotificationChanged += OnNotificationChanged;
+            _started = true;
+        }
 
         await Task.CompletedTask;
         return true;
     }
 
     private async void OnNotificationChanged(
+        UserNotificationListener sender,
+        UserNotificationChangedEventArgs args) => await HandleNotificationChangeAsync(sender, args);
+
+    private async Task HandleNotificationChangeAsync(
         UserNotificationListener sender,
         UserNotificationChangedEventArgs args)
     {
@@ -53,7 +63,8 @@ public sealed class NotificationListenerService : IAsyncDisposable
                 if (texts.Count == 0)
                     continue;
 
-                var title = texts.Count > 0 ? texts[0].Text : "";
+                // CWE-571: Removed redundant condition; Count is guaranteed > 0 here
+                var title = texts[0].Text;
                 var body = texts.Count > 1 ? texts[1].Text : "";
 
                 var appName = notification.AppInfo.DisplayInfo.DisplayName;
@@ -67,16 +78,20 @@ public sealed class NotificationListenerService : IAsyncDisposable
                         body));
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // Notification access can be revoked at any time.
+            // CWE-778: Log notification access errors for security auditing
+            Debug.WriteLine($"NotificationListenerService error: {ex.GetType().Name} - {ex.Message}");
         }
     }
 
     public ValueTask DisposeAsync()
     {
-        if (_started)
-            _listener.NotificationChanged -= OnNotificationChanged;
+        lock (_lockObject) // CWE-567, CWE-662: Synchronized access
+        {
+            if (_started)
+                _listener.NotificationChanged -= OnNotificationChanged;
+        }
 
         return ValueTask.CompletedTask;
     }

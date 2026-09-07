@@ -3,6 +3,7 @@ using System;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Diagnostics;
 
 namespace LockScreenHub.Services;
 
@@ -13,24 +14,35 @@ namespace LockScreenHub.Services;
 /// </summary>
 public sealed class SteamDownloadMonitor
 {
+    /// <summary>
+    /// Placeholder for Phase 3 implementation when Steam integration is added.
+    /// </summary>
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Usage", "CS0067:Event is never used")]
     public event EventHandler<DownloadProgress>? ProgressChanged;
 
-    private CancellationTokenSource? _cts;
+    private volatile CancellationTokenSource? _cts; // Thread-safe field access for CWE-820
+    private readonly object _lockObject = new();
 
     public void Start()
     {
-        if (_cts is not null)
-            return;
+        lock (_lockObject) // CWE-567, CWE-662: Synchronized access
+        {
+            if (_cts is not null)
+                return;
 
-        _cts = new CancellationTokenSource();
-        _ = MonitorAsync(_cts.Token);
+            _cts = new CancellationTokenSource();
+            _ = MonitorAsync(_cts.Token);
+        }
     }
 
     public void Stop()
     {
-        _cts?.Cancel();
-        _cts?.Dispose();
-        _cts = null;
+        lock (_lockObject) // CWE-567, CWE-662: Synchronized access
+        {
+            _cts?.Cancel();
+            _cts?.Dispose();
+            _cts = null;
+        }
     }
 
     private async Task MonitorAsync(CancellationToken token)
