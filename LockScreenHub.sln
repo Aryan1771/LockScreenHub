@@ -1,6 +1,7 @@
+﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
-# Visual Studio Version 18
-VisualStudioVersion = 18.0.0.0
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.37614.0 d17.14
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LockScreenHub", "LockScreenHub.csproj", "{A0C4F2F1-3B8B-4F13-8F24-0A9E1E0A5B11}"
 EndProject
@@ -14,5 +15,8 @@ Global
 		{A0C4F2F1-3B8B-4F13-8F24-0A9E1E0A5B11}.Debug|x64.Build.0 = Debug|x64
 		{A0C4F2F1-3B8B-4F13-8F24-0A9E1E0A5B11}.Release|x64.ActiveCfg = Release|x64
 		{A0C4F2F1-3B8B-4F13-8F24-0A9E1E0A5B11}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
 	EndGlobalSection
 EndGlobal
