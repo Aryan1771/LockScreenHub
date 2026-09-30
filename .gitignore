@@ -1,3 +1,27 @@
-obj/
-bin/
+# Build output
+**/bin/
+**/obj/
 .vs/
+TestResults/
+/publish/
+/artifacts/
+
+# IDE and user-specific files
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Windows packaging output
+*.appx
+*.appxbundle
+*.appxupload
+*.msix
+*.msixbundle
+*.msixupload
+*.appinstaller
