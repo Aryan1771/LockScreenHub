@@ -23,6 +23,16 @@ internal sealed class BridgeHost : IAsyncDisposable
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
+        InitializeNotifications();
+
+        var steamTask = steam.RunAsync(cancellationToken);
+        var browserTask = browsers.RunAsync(cancellationToken);
+        await Task.WhenAll(steamTask, browserTask);
+    }
+
+    private void InitializeNotifications()
+    {
+        if (registered) return;
         try
         {
             AppNotificationManager.Default.Register();
@@ -33,99 +43,146 @@ internal sealed class BridgeHost : IAsyncDisposable
         {
             log.Error("Windows notifications unavailable", ex);
         }
+    }
 
-        var steamTask = steam.RunAsync(cancellationToken);
-        var browserTask = browsers.RunAsync(cancellationToken);
-        await Task.WhenAll(steamTask, browserTask);
+    public async Task RunNotificationSelfTestAsync()
+    {
+        InitializeNotifications();
+        if (!registered) throw new InvalidOperationException("Windows app notifications could not be initialized; see the bridge log.");
+
+        foreach (var kind in new[] { "Download", "Upload" })
+        {
+            var tag = kind.Equals("Download", StringComparison.Ordinal) ? "test-download" : "test-upload";
+            var title = $"Simulated {kind.ToLowerInvariant()}";
+            var data = new AppNotificationProgressData(++sequence)
+            {
+                Title = title,
+                Status = "Self-test started",
+                Value = 0.1,
+                ValueStringOverride = "10% · 1 MB / 10 MB"
+            };
+            var notification = new AppNotificationBuilder()
+                .AddText("LockScreen Notification Bridge self-test")
+                .AddText(title)
+                .AddProgressBar(new AppNotificationProgressBar().BindTitle().BindStatus().BindValue().BindValueStringOverride())
+                .BuildNotification();
+            notification.Tag = tag;
+            notification.Group = "bridge-self-test";
+            notification.Progress = data;
+            AppNotificationManager.Default.Show(notification);
+            log.Info($"Self-test notification created: {kind}");
+
+            await Task.Delay(TimeSpan.FromSeconds(1));
+            data = new AppNotificationProgressData(++sequence)
+            {
+                Title = title,
+                Status = "Self-test progress update",
+                Value = 0.6,
+                ValueStringOverride = "60% · 6 MB / 10 MB"
+            };
+            var result = await AppNotificationManager.Default.UpdateAsync(data, tag, "bridge-self-test");
+            log.Info($"Self-test {kind} update result: {result}");
+
+            await Task.Delay(TimeSpan.FromSeconds(1));
+            data = new AppNotificationProgressData(++sequence)
+            {
+                Title = title,
+                Status = "Self-test complete",
+                Value = 1,
+                ValueStringOverride = "10 MB / 10 MB"
+            };
+            result = await AppNotificationManager.Default.UpdateAsync(data, tag, "bridge-self-test");
+            log.Info($"Self-test {kind} completion update result: {result}");
+        }
     }
 
     private async Task OnSnapshotAsync(IReadOnlyList<SteamDownload> downloads)
     {
         if (!registered) return;
-        if (downloads.Count == 0)
+        var activeIds = downloads.Select(x => x.Id).ToHashSet(StringComparer.Ordinal);
+        foreach (var item in lastShown.Values.Where(x => !x.IsComplete && !activeIds.Contains(x.Id) && inactiveShown.Add(x.Id)))
         {
-            foreach (var item in lastShown.Values.Where(x => !x.IsComplete && inactiveShown.Add(x.Id)))
+            try
             {
-                try
-                {
-                    var ended = new AppNotificationBuilder()
-                        .AddText("Steam activity no longer active")
-                        .AddText(item.Name)
-                        .BuildNotification();
-                    ended.Tag = Tag(item.Id);
-                    ended.Group = "steam-downloads";
-                    AppNotificationManager.Default.Show(ended);
-                    log.Info("Steam download activity ended or paused");
-                }
-                catch (Exception ex) { log.Error("Steam inactive status notification failed", ex); }
-            }
-            return;
-        }
-        var active = downloads.OrderByDescending(x => x.BytesToDownload > 0 ? (double)x.BytesDownloaded / x.BytesToDownload : -1).First();
-        var resumed = inactiveShown.Remove(active.Id);
-        await updateGate.WaitAsync();
-        try
-        {
-            if (lastShown.TryGetValue(active.Id, out var prior) &&
-                active.BytesToDownload == prior.BytesToDownload &&
-                Percentage(active) == Percentage(prior) &&
-                active.IsComplete == prior.IsComplete &&
-                active.IsDownloading == prior.IsDownloading &&
-                RateBucket(active) == RateBucket(prior))
-                return;
-
-            if (active.IsComplete)
-            {
-                var complete = new AppNotificationBuilder()
-                    .AddText("Steam activity complete")
-                    .AddText(active.Name)
+                var ended = new AppNotificationBuilder()
+                    .AddText("Steam activity no longer active")
+                    .AddText(item.Name)
                     .BuildNotification();
-                complete.Tag = Tag(active.Id);
-                complete.Group = "steam-downloads";
-                AppNotificationManager.Default.Show(complete);
-                log.Info("Steam activity completed");
+                ended.Tag = Tag(item.Id);
+                ended.Group = "steam-downloads";
+                AppNotificationManager.Default.Show(ended);
+                log.Info($"Steam activity ended or paused: {item.Name}");
             }
-            else
-            {
-                var percent = active.BytesToDownload > 0
-                    ? Math.Clamp((double)active.BytesDownloaded / active.BytesToDownload, 0, 1)
-                    : 0;
-                var data = new AppNotificationProgressData(++sequence)
-                {
-                    Title = "Steam activity",
-                    Status = SteamStatus(active),
-                    Value = percent,
-                    ValueStringOverride = active.BytesToDownload > 0 ? $"{percent:P0} · {FormatBytes(active.BytesDownloaded)} / {FormatBytes(active.BytesToDownload)}" : "Progress unavailable"
-                };
+            catch (Exception ex) { log.Error("Steam inactive status notification failed", ex); }
+        }
 
-                if (!lastShown.ContainsKey(active.Id) || resumed)
+        foreach (var active in downloads.OrderBy(x => x.Id, StringComparer.Ordinal))
+        {
+            var resumed = inactiveShown.Remove(active.Id);
+            await updateGate.WaitAsync();
+            try
+            {
+                if (!resumed && lastShown.TryGetValue(active.Id, out var prior) &&
+                    active.BytesToDownload == prior.BytesToDownload &&
+                    Percentage(active) == Percentage(prior) &&
+                    active.IsComplete == prior.IsComplete &&
+                    active.IsDownloading == prior.IsDownloading &&
+                    RateBucket(active) == RateBucket(prior))
+                    continue;
+
+                if (active.IsComplete)
                 {
-                    var notification = new AppNotificationBuilder()
-                        .AddText("Steam activity")
+                    var complete = new AppNotificationBuilder()
+                        .AddText("Steam activity complete")
                         .AddText(active.Name)
-                        .AddProgressBar(new AppNotificationProgressBar().BindTitle().BindStatus().BindValue().BindValueStringOverride())
                         .BuildNotification();
-                    notification.Tag = Tag(active.Id);
-                    notification.Group = "steam-downloads";
-                    notification.Progress = data;
-                    AppNotificationManager.Default.Show(notification);
+                    complete.Tag = Tag(active.Id);
+                    complete.Group = "steam-downloads";
+                    AppNotificationManager.Default.Show(complete);
+                    log.Info("Steam activity completed");
                 }
                 else
                 {
-                    var result = await AppNotificationManager.Default.UpdateAsync(data, Tag(active.Id), "steam-downloads");
-                    log.Info($"Steam progress update result: {result}; reported={Percentage(active)}%");
-                    if (result != AppNotificationProgressResult.Succeeded)
+                    var percent = active.BytesToDownload > 0
+                        ? Math.Clamp((double)active.BytesDownloaded / active.BytesToDownload, 0, 1)
+                        : 0;
+                    var data = new AppNotificationProgressData(++sequence)
                     {
-                        AppNotificationManager.Default.Show(BuildSteamProgressNotification(active, data));
-                        log.Info("Steam progress card recreated after Windows update was unavailable");
+                        Title = "Steam activity",
+                        Status = SteamStatus(active),
+                        Value = percent,
+                        ValueStringOverride = active.BytesToDownload > 0 ? $"{percent:P0} · {FormatBytes(active.BytesDownloaded)} / {FormatBytes(active.BytesToDownload)}" : "Progress unavailable"
+                    };
+
+                    if (!lastShown.ContainsKey(active.Id) || resumed)
+                    {
+                        var notification = new AppNotificationBuilder()
+                            .AddText("Steam activity")
+                            .AddText(active.Name)
+                            .AddProgressBar(new AppNotificationProgressBar().BindTitle().BindStatus().BindValue().BindValueStringOverride())
+                            .BuildNotification();
+                        notification.Tag = Tag(active.Id);
+                        notification.Group = "steam-downloads";
+                        notification.Progress = data;
+                        AppNotificationManager.Default.Show(notification);
                     }
+                    else
+                    {
+                        var result = await AppNotificationManager.Default.UpdateAsync(data, Tag(active.Id), "steam-downloads");
+                        log.Info($"Steam progress update result: {result}; reported={Percentage(active)}% for {active.Name}");
+                        if (result != AppNotificationProgressResult.Succeeded)
+                        {
+                            AppNotificationManager.Default.Show(BuildSteamProgressNotification(active, data));
+                            log.Info("Steam progress card recreated after Windows update was unavailable");
+                        }
+                    }
+                    log.Info($"Steam activity notification updated: {active.Name}");
                 }
-                log.Info("Steam activity notification updated");
+                lastShown[active.Id] = active;
             }
-            lastShown[active.Id] = active;
+            catch (Exception ex) { log.Error("Steam notification update failed", ex); }
+            finally { updateGate.Release(); }
         }
-        catch (Exception ex) { log.Error("Steam notification update failed", ex); }
-        finally { updateGate.Release(); }
     }
 
     private AppNotification BuildSteamProgressNotification(SteamDownload active, AppNotificationProgressData data)
@@ -143,9 +200,22 @@ internal sealed class BridgeHost : IAsyncDisposable
 
     private async Task OnBrowserSnapshotAsync(IReadOnlyList<BrowserDownloadActivity> activities)
     {
-        if (!registered || activities.Count == 0) return;
+        if (!registered) return;
         try
         {
+            if (activities.Count == 0)
+            {
+                var ended = new AppNotificationBuilder()
+                    .AddText("Browser download activity ended")
+                    .AddText("No incomplete browser download files remain")
+                    .BuildNotification();
+                ended.Tag = "browser-downloads";
+                ended.Group = "file-activity";
+                AppNotificationManager.Default.Show(ended);
+                log.Info("Browser download activity ended");
+                return;
+            }
+
             var files = activities.Sum(x => x.FileCount);
             var bytes = activities.Aggregate(0UL, (sum, item) => sum + item.BytesReceived);
             var browsers = string.Join(", ", activities.Select(x => x.Browser).Distinct(StringComparer.OrdinalIgnoreCase));

@@ -1,6 +1,16 @@
 using LockScreenNotificationBridge;
 using System.Security.Principal;
 
+if (args.Contains("--self-test-notifications", StringComparer.Ordinal))
+{
+    using var testLog = new RotatingLog();
+    testLog.Info("Notification self-test started");
+    await using var testBridge = new BridgeHost(testLog);
+    await testBridge.RunNotificationSelfTestAsync();
+    testLog.Info("Notification self-test finished");
+    return;
+}
+
 var sid = WindowsIdentity.GetCurrent().User?.Value ?? Environment.UserName;
 using var instanceMutex = new Mutex(initiallyOwned: true, $@"Local\LockScreenNotificationBridge-{sid}", out var isFirstInstance);
 if (!isFirstInstance) return;

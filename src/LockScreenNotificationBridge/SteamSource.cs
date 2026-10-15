@@ -16,6 +16,8 @@ internal sealed class SteamSource : IDisposable
     private Timer? timer;
     private CancellationToken cancellationToken;
     private bool steamDetected;
+    private readonly HashSet<string> activeThisSession = new(StringComparer.Ordinal);
+    private DateTime? observedSteamSessionStart;
     private DateTime contentLogWriteUtc = DateTime.MinValue;
     private Dictionary<string, ContentLogState> cachedContentLog = new(StringComparer.Ordinal);
     private double? cachedDownloadRateMbps;
@@ -87,7 +89,19 @@ internal sealed class SteamSource : IDisposable
             var steamStartedAt = GetSteamStartTime();
             var running = steamStartedAt.HasValue;
             if (running && !steamDetected) { steamDetected = true; log.Info("Steam detected"); }
-            if (!running && steamDetected) { steamDetected = false; log.Info("Steam is not running"); }
+            if (!running && steamDetected)
+            {
+                steamDetected = false;
+                observedSteamSessionStart = null;
+                activeThisSession.Clear();
+                log.Info("Steam is not running");
+            }
+            else if (running && steamStartedAt != observedSteamSessionStart)
+            {
+                observedSteamSessionStart = steamStartedAt;
+                activeThisSession.Clear();
+                log.Info("Steam session changed; clearing previous download state");
+            }
 
             var logState = ReadContentLog(roots);
             var downloads = roots.SelectMany(ReadLibrary).Select(d =>
@@ -100,14 +114,31 @@ internal sealed class SteamSource : IDisposable
             }).ToArray();
             // Manifest counters often remain nonzero after a download is paused or finished.
             // Only show progress when Steam logged an active download in this Steam session.
-            var active = running
-                ? downloads.Where(d =>
-                    !d.IsComplete && d.BytesToDownload > 0 &&
-                    logState.TryGetValue(d.Id, out var state) && state.IsDownloading &&
-                    steamStartedAt is { } startedAt && state.StateTime >= startedAt.AddSeconds(-5))
-                    .ToArray()
-                : Array.Empty<SteamDownload>();
-            await onSnapshot(active);
+            var active = new List<SteamDownload>();
+            var completed = new List<SteamDownload>();
+            var activeNow = new HashSet<string>(StringComparer.Ordinal);
+            if (running && steamStartedAt is { } sessionStart)
+            {
+                foreach (var item in downloads)
+                {
+                    if (!logState.TryGetValue(item.Id, out var state) || state.StateTime < sessionStart.AddSeconds(-5)) continue;
+                    if (state.IsDownloading)
+                    {
+                        activeNow.Add(item.Id);
+                        if (!item.IsComplete && item.BytesToDownload > 0)
+                            active.Add(item with { IsDownloading = true });
+                    }
+                    else if (activeThisSession.Contains(item.Id) && item.IsComplete)
+                    {
+                        // Bytes are complete after a download was observed in this session. Steam may still verify files.
+                        completed.Add(item with { IsComplete = true, IsDownloading = false });
+                    }
+                }
+            }
+
+            activeThisSession.Clear();
+            activeThisSession.UnionWith(activeNow);
+            await onSnapshot(active.Concat(completed).ToArray());
         }
         catch (Exception ex) { log.Error("Steam source scan failed", ex); }
         finally

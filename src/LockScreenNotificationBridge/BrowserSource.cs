@@ -16,10 +16,12 @@ internal sealed class BrowserSource : IDisposable
     private readonly Func<IReadOnlyList<BrowserDownloadActivity>, Task> onSnapshot;
     private readonly SemaphoreSlim scanGate = new(1, 1);
     private readonly List<FileSystemWatcher> watchers = new();
-    private readonly Dictionary<string, (int Count, ulong Bytes)> previous = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, (int Count, ulong Bytes)> lastNotified = new(StringComparer.OrdinalIgnoreCase);
     private Timer? timer;
     private CancellationToken token;
     private DateTimeOffset lastNotification = DateTimeOffset.MinValue;
+    private bool initialized;
+    private bool notificationActive;
 
     public BrowserSource(RotatingLog log, Func<IReadOnlyList<BrowserDownloadActivity>, Task> onSnapshot)
     {
@@ -66,7 +68,7 @@ internal sealed class BrowserSource : IDisposable
         {
             // Refresh discovery periodically so new profiles or configured target folders are found.
             var roots = DiscoverDirectories();
-            var byBrowser = new Dictionary<string, (int Count, ulong Bytes)>(StringComparer.OrdinalIgnoreCase);
+            var byBrowser = new Dictionary<string, (int Count, ulong Bytes, DateTime LatestWriteUtc)>(StringComparer.OrdinalIgnoreCase);
             foreach (var root in roots)
             {
                 if (!Directory.Exists(root)) continue;
@@ -80,7 +82,8 @@ internal sealed class BrowserSource : IDisposable
                         {
                             var info = new FileInfo(file);
                             var current = byBrowser.GetValueOrDefault(label);
-                            byBrowser[label] = (current.Count + 1, current.Bytes + (ulong)Math.Max(0, info.Length));
+                            byBrowser[label] = (current.Count + 1, current.Bytes + (ulong)Math.Max(0, info.Length),
+                                info.LastWriteTimeUtc > current.LatestWriteUtc ? info.LastWriteTimeUtc : current.LatestWriteUtc);
                         }
                         catch (IOException) { }
                         catch (UnauthorizedAccessException) { }
@@ -90,24 +93,40 @@ internal sealed class BrowserSource : IDisposable
                 catch (UnauthorizedAccessException) { }
             }
 
-            foreach (var item in byBrowser)
+            if (!initialized)
             {
-                var old = previous.GetValueOrDefault(item.Key);
-                var current = item.Value;
-                if (current == old) continue;
-
-                // One card is replaced by its stable tag. Suppress tiny/high-frequency file churn.
-                var materiallyChanged = old.Count == 0 || current.Count != old.Count ||
-                    (current.Bytes > old.Bytes && current.Bytes - old.Bytes >= 5UL * 1024 * 1024);
-                if (!materiallyChanged) { previous[item.Key] = current; continue; }
-                if (DateTimeOffset.UtcNow - lastNotification < TimeSpan.FromSeconds(15)) continue;
-                previous[item.Key] = current;
-                lastNotification = DateTimeOffset.UtcNow;
-                await onSnapshot([new BrowserDownloadActivity(item.Key, current.Count, current.Bytes)]);
+                initialized = true;
+                foreach (var item in byBrowser) lastNotified[item.Key] = (item.Value.Count, item.Value.Bytes);
+                var recentlyWritten = byBrowser.Values.Any(x => x.LatestWriteUtc >= DateTime.UtcNow.AddSeconds(-30));
+                if (!recentlyWritten) return; // Seed old partial files without replaying stale activity on sign-in.
+                lastNotified.Clear();
             }
 
-            foreach (var oldLabel in previous.Keys.Except(byBrowser.Keys, StringComparer.OrdinalIgnoreCase).ToArray())
-                previous[oldLabel] = (0, 0);
+            var now = DateTimeOffset.UtcNow;
+            if (byBrowser.Count == 0)
+            {
+                if (notificationActive && now - lastNotification >= TimeSpan.FromSeconds(15))
+                {
+                    await onSnapshot(Array.Empty<BrowserDownloadActivity>());
+                    notificationActive = false;
+                    lastNotified.Clear();
+                    lastNotification = now;
+                }
+                return;
+            }
+
+            // Compare against the last delivered card so many small writes accumulate to the update threshold.
+            var materiallyChanged = byBrowser.Count != lastNotified.Count ||
+                byBrowser.Any(item => !lastNotified.TryGetValue(item.Key, out var old) ||
+                    item.Value.Count != old.Count ||
+                    Math.Abs((decimal)item.Value.Bytes - old.Bytes) >= 5m * 1024 * 1024);
+            if (!materiallyChanged || now - lastNotification < TimeSpan.FromSeconds(15)) return;
+
+            await onSnapshot(byBrowser.Select(item => new BrowserDownloadActivity(item.Key, item.Value.Count, item.Value.Bytes)).ToArray());
+            lastNotified.Clear();
+            foreach (var item in byBrowser) lastNotified[item.Key] = (item.Value.Count, item.Value.Bytes);
+            notificationActive = true;
+            lastNotification = now;
         }
         catch (Exception ex) { log.Error("Browser download scan failed", ex); }
         finally { scanGate.Release(); }

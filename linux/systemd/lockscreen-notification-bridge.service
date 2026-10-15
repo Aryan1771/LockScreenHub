@@ -1,0 +1,19 @@
+[Unit]
+Description=LockScreen Notification Bridge (user session)
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/lib/lockscreen-notification-bridge/bridge.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/lockscreen-notification-bridge
+
+[Install]
+WantedBy=default.target
