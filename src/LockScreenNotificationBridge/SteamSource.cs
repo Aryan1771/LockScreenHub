@@ -7,6 +7,8 @@ internal sealed record SteamDownload(string Id, string Name, ulong BytesDownload
 
 internal sealed class SteamSource : IDisposable
 {
+    private sealed record ContentLogState(ulong Downloaded, ulong Total, bool IsDownloading, DateTime StateTime);
+
     private readonly RotatingLog log;
     private readonly Func<IReadOnlyList<SteamDownload>, Task> onSnapshot;
     private readonly List<FileSystemWatcher> watchers = new();
@@ -15,7 +17,7 @@ internal sealed class SteamSource : IDisposable
     private CancellationToken cancellationToken;
     private bool steamDetected;
     private DateTime contentLogWriteUtc = DateTime.MinValue;
-    private Dictionary<string, (ulong Downloaded, ulong Total, bool IsDownloading)> cachedContentLog = new(StringComparer.Ordinal);
+    private Dictionary<string, ContentLogState> cachedContentLog = new(StringComparer.Ordinal);
     private double? cachedDownloadRateMbps;
     private DateTime? cachedDownloadRateTime;
 
@@ -82,7 +84,8 @@ internal sealed class SteamSource : IDisposable
         try
         {
             var roots = FindLibraryRoots();
-            var running = IsSteamRunning();
+            var steamStartedAt = GetSteamStartTime();
+            var running = steamStartedAt.HasValue;
             if (running && !steamDetected) { steamDetected = true; log.Info("Steam detected"); }
             if (!running && steamDetected) { steamDetected = false; log.Info("Steam is not running"); }
 
@@ -95,27 +98,43 @@ internal sealed class SteamSource : IDisposable
                 var rateIsFresh = cachedDownloadRateTime is { } rateTime && DateTime.Now - rateTime <= TimeSpan.FromSeconds(90);
                 return d with { BytesDownloaded = downloaded, BytesToDownload = total, IsComplete = total > 0 && downloaded >= total, IsDownloading = state.IsDownloading, SteamTotalRateMbps = state.IsDownloading && rateIsFresh ? cachedDownloadRateMbps : null };
             }).ToArray();
-            var logActive = downloads.Where(d => d.IsDownloading && !d.IsComplete && d.BytesToDownload > 0).ToArray();
-            var active = logActive.Length > 0 ? logActive : downloads.Where(d => !d.IsComplete && d.BytesToDownload > 0 && d.BytesDownloaded > 0).ToArray();
+            // Manifest counters often remain nonzero after a download is paused or finished.
+            // Only show progress when Steam logged an active download in this Steam session.
+            var active = running
+                ? downloads.Where(d =>
+                    !d.IsComplete && d.BytesToDownload > 0 &&
+                    logState.TryGetValue(d.Id, out var state) && state.IsDownloading &&
+                    steamStartedAt is { } startedAt && state.StateTime >= startedAt.AddSeconds(-5))
+                    .ToArray()
+                : Array.Empty<SteamDownload>();
             await onSnapshot(active);
         }
         catch (Exception ex) { log.Error("Steam source scan failed", ex); }
         finally
         {
             scanGate.Release();
-            var running = IsSteamRunning();
+            var running = GetSteamStartTime().HasValue;
             timer?.Change(running ? TimeSpan.FromSeconds(30) : TimeSpan.FromMinutes(2), running ? TimeSpan.FromSeconds(30) : TimeSpan.FromMinutes(2));
         }
     }
 
-    private static bool IsSteamRunning()
+    private static DateTime? GetSteamStartTime()
     {
-        var running = false;
+        DateTime? latestStart = null;
         foreach (var process in Process.GetProcessesByName("steam"))
         {
-            using (process) running = true;
+            using (process)
+            {
+                try
+                {
+                    var started = process.StartTime;
+                    if (latestStart is null || started > latestStart) latestStart = started;
+                }
+                catch (InvalidOperationException) { }
+                catch (System.ComponentModel.Win32Exception) { }
+            }
         }
-        return running;
+        return latestStart;
     }
 
     private static IEnumerable<SteamDownload> ReadLibrary(string library)
@@ -135,13 +154,14 @@ internal sealed class SteamSource : IDisposable
         }
     }
 
-    private Dictionary<string, (ulong Downloaded, ulong Total, bool IsDownloading)> ReadContentLog(IEnumerable<string> roots)
+    private Dictionary<string, ContentLogState> ReadContentLog(IEnumerable<string> roots)
     {
         var paths = roots.Select(root => Path.Combine(root, "logs", "content_log.txt"))
             .Where(File.Exists).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         var newestWrite = paths.Select(File.GetLastWriteTimeUtc).DefaultIfEmpty(DateTime.MinValue).Max();
         if (newestWrite <= contentLogWriteUtc) return cachedContentLog;
         var latestState = new Dictionary<string, bool>(StringComparer.Ordinal);
+        var latestStateTime = new Dictionary<string, DateTime>(StringComparer.Ordinal);
         var latestProgress = new Dictionary<string, (ulong Downloaded, ulong Total)>(StringComparer.Ordinal);
         double? latestRate = null;
         foreach (var path in paths)
@@ -154,8 +174,10 @@ internal sealed class SteamSource : IDisposable
                     if (state.Success)
                     {
                         var detail = state.Groups[2].Value;
-                        latestState[state.Groups[1].Value] = detail.Contains("Running Update", StringComparison.OrdinalIgnoreCase) &&
+                        var appId = state.Groups[1].Value;
+                        latestState[appId] = detail.Contains("Running Update", StringComparison.OrdinalIgnoreCase) &&
                             detail.Contains("Downloading", StringComparison.OrdinalIgnoreCase);
+                        if (TryGetLogTimestamp(line, out var stateTime)) latestStateTime[appId] = stateTime;
                     }
 
                     var progress = Regex.Match(line, @"AppID\s+(\d+)\s+update started\s*:\s*download\s+(\d+)/(\d+)", RegexOptions.IgnoreCase);
@@ -178,11 +200,20 @@ internal sealed class SteamSource : IDisposable
 
         cachedContentLog = latestProgress.ToDictionary(
             x => x.Key,
-            x => (x.Value.Downloaded, x.Value.Total, latestState.GetValueOrDefault(x.Key)),
+            x => new ContentLogState(x.Value.Downloaded, x.Value.Total, latestState.GetValueOrDefault(x.Key),
+                latestStateTime.GetValueOrDefault(x.Key, DateTime.MinValue)),
             StringComparer.Ordinal);
         contentLogWriteUtc = newestWrite;
         cachedDownloadRateMbps = latestRate;
         return cachedContentLog;
+    }
+
+    private static bool TryGetLogTimestamp(string line, out DateTime timestamp)
+    {
+        timestamp = default;
+        var match = Regex.Match(line, @"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]");
+        return match.Success && DateTime.TryParseExact(match.Groups[1].Value, "yyyy-MM-dd HH:mm:ss",
+            System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeLocal, out timestamp);
     }
 
     private static string? Field(string text, string name)

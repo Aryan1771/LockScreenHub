@@ -15,7 +15,7 @@ Initial development environment: Windows 11 Home Single Language, OS build 26200
 - Reading other apps' notification content: Windows' listener requires a manifest capability and explicit access request. Omitted; the background process must not read WhatsApp messages or other private content.
 - WhatsApp forwarding: not needed when WhatsApp already emits its own Windows notification. Native notification handling remains untouched.
 - Microsoft Store progress: no reliable general-purpose local progress source is implemented. No Store values are fabricated.
-- Steam phase accuracy: local ACF manifest byte fields are best-effort implementation details, not a stable public API. They do not fully identify queue state, paused/resumed state, verification, patching, or completion. The source also reads `content_log.txt` for state transitions, byte snapshots, and recent Steam-wide rate samples. These sources remain best-effort observations, not a stable per-game telemetry API.
+- Steam phase accuracy: local ACF manifest byte fields are best-effort implementation details, not a stable public API. They do not fully identify queue state, paused/resumed state, verification, patching, or completion. The source also reads `content_log.txt` for state transitions, byte snapshots, and recent Steam-wide rate samples. Progress cards require an explicit active state from the current Steam process session; stale manifest counters or old log state are not sufficient to show a card. These sources remain best-effort observations, not a stable per-game telemetry API.
 - Download completion: not surfaced yet. A manifest disappearing or byte counters resetting cannot safely distinguish completion from pause/removal/Steam maintenance.
 
 ## References
